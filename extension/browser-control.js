@@ -118,6 +118,25 @@ export function createBrowserControl(chrome, transport, protectedTab = () => fal
       throw cause;
     }
   }
+  async function restoreUnloadedTab(state, command) {
+    const original = await currentTab(state,command);
+    if (original.status !== 'unloaded') return;
+    // Discarded renderers can accept debugger.attach but time out on Page.enable.
+    // Only an explicit attach may reload this exact tab, after live authorization.
+    if (!policy.write) error('BROWSER_TAB_UNLOADED: restoring this tab needs browser write permission. The existing tab was left unchanged.');
+    await authorize(command);
+    alive(state,command);
+    try { await chrome.tabs.reload(state.tabId); }
+    catch (cause) { error(`BROWSER_TAB_UNLOADED: reload failed (${cut(cause?.message || cause,250)}). The existing tab was not closed or replaced.`); }
+    const deadline = Math.min(Date.now() + 10000,command.expiresAt - 1500);
+    while (Date.now() < deadline) {
+      alive(state,command);
+      const tab = await currentTab(state,command);
+      if (tab.status === 'complete' && (!tab.pendingUrl || tab.pendingUrl === tab.url)) return;
+      await new Promise(resolve => setTimeout(resolve,250));
+    }
+    error('BROWSER_TAB_UNLOADED: reload was requested but Chrome did not finish restoring this tab in time. Inspect the same tab; do not retry input blindly.');
+  }
   async function input(state, method, params, command) {
     await authorize(command);
     await currentTab(state,command);
@@ -219,6 +238,7 @@ export function createBrowserControl(chrome, transport, protectedTab = () => fal
     try {
       await currentTab(state,command);
       if (!previous) {
+        await restoreUnloadedTab(state,command);
         await save(); // Crash before/after attach never grants an automatic reattach.
         await chrome.debugger.attach({ tabId },'1.3');
         acquired = true;
